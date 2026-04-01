@@ -38,7 +38,10 @@ if $CO_EXISTS && $COSH_EXISTS && $COPILOT_EXISTS; then
     exit 0
 fi
 
-read -p "Do you want to proceed? (y/n) " -n 1 -r
+if ! read -t 30 -p "Do you want to proceed? (y/n, auto-yes in 30s) " -n 1 -r; then
+    REPLY="y"
+    echo " (timeout, auto-accepted)"
+fi
 echo ""
 if [[ "${REPLY}" =~ ^[Yy]$ ]]; then
     if ! $CO_EXISTS; then echo "${ALIAS_CO}" >> "${CONFIG_FILE}"; fi
