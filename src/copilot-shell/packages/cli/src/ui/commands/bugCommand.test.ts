@@ -67,7 +67,7 @@ Session ID: test-session-id
 Proxy: no proxy
 Memory Usage: 100 MB`;
     const expectedUrl =
-      'https://github.com/QwenLM/qwen-code/issues/new?template=bug_report.yml&title=A%20test%20bug&info=' +
+      'https://github.com/alibaba/anolisa/issues/new?template=bug_report.yml&title=A%20test%20bug&environment=' +
       encodeURIComponent(`\n${expectedInfo}\n`);
 
     expect(open).toHaveBeenCalledWith(expectedUrl);
@@ -151,7 +151,7 @@ Session ID: test-session-id
 Proxy: no proxy
 Memory Usage: 100 MB`;
     const expectedUrl =
-      'https://github.com/QwenLM/qwen-code/issues/new?template=bug_report.yml&title=OpenAI%20bug&info=' +
+      'https://github.com/alibaba/anolisa/issues/new?template=bug_report.yml&title=OpenAI%20bug&environment=' +
       encodeURIComponent(`\n${expectedInfo}\n`);
 
     expect(open).toHaveBeenCalledWith(expectedUrl);
