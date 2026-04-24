@@ -25,16 +25,16 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::aggregator::Aggregator;
 use crate::analyzer::Analyzer;
-use crate::config::{self, AgentsightConfig};
+use crate::config::AgentsightConfig;
 use crate::discovery::AgentScanner;
 use crate::event::Event;
+use crate::ffi::{FfiEvent, FfiEventSender};
 use crate::genai::{GenAIBuilder, GenAIExporter, GenAIStore, SlsUploader};
-use crate::genai::builder::BuildOutput;
 use crate::genai::semantic::GenAISemanticEvent;
 use crate::parser::Parser;
 use crate::probes::{Probes, ProbesPoller, FileWatchEvent, FileWriteEvent};
 use crate::storage::{
-    SqliteConfig, Storage, StorageBackend, TimePeriod, TokenQuery, TokenQueryResult,
+    SqliteConfig, Storage, TimePeriod, TokenQuery, TokenQueryResult,
 };
 use crate::storage::sqlite::GenAISqliteStore;
 use crate::tokenizer::LlmTokenizer;
@@ -78,6 +78,8 @@ pub struct AgentSight {
     response_mapper: ResponseSessionMapper,
     /// Pending GenAI events awaiting session_id resolution from ResponseSessionMapper
     pending_genai: Vec<PendingGenAI>,
+    /// Optional FFI event sender (set when running in FFI/C-API mode)
+    ffi_sender: Option<FfiEventSender>,
 }
 
 /// GenAI events waiting for session_id resolution via ResponseSessionMapper.
@@ -91,13 +93,6 @@ struct PendingGenAI {
 
 /// Maximum time to wait for ResponseSessionMapper to resolve a session_id
 const PENDING_SESSION_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-
-/// Result of processing an event
-#[derive(Debug)]
-pub struct ProcessResult {
-    /// Number of events processed so far
-    pub event_count: u64,
-}
 
 impl AgentSight {
     /// Create a new AgentSight instance from configuration
@@ -218,6 +213,7 @@ impl AgentSight {
             filewatch_callback: None,
             response_mapper: ResponseSessionMapper::new(),
             pending_genai: Vec::new(),
+            ffi_sender: None,
         })
     }
 
@@ -276,7 +272,7 @@ impl AgentSight {
 
     /// Try to receive and process the next event (non-blocking)
     /// Returns None if no event is available
-    pub fn try_process(&mut self) -> Option<ProcessResult> {
+    pub fn try_process(&mut self) -> Option<u64> {
         if !self.running.load(Ordering::SeqCst) {
             return None;
         }
@@ -332,21 +328,28 @@ impl AgentSight {
                     // Session_id resolved (or no response_id) — export immediately
                     self.export_genai_events(&output.events);
                 }
+            } else if let Some(ref sender) = self.ffi_sender {
+                // No LLM event produced — send plain HTTP data via FFI channel
+                for ar in &analysis_results {
+                    if let crate::analyzer::AnalysisResult::Http(record) = ar {
+                        sender.send(FfiEvent::Https(record.clone()));
+                    }
+                }
             }
-            
-            // Store analysis results
-            for analysis_result in &analysis_results {
-                if let Err(e) = self.storage.store(analysis_result) {
-                    log::warn!("Failed to store analysis result: {}", e);
-                } else {
-                    log::debug!("Analysis result saved");
+
+            // In FFI mode data is delivered via callbacks; skip local storage.
+            if self.ffi_sender.is_none() {
+                for analysis_result in &analysis_results {
+                    if let Err(e) = self.storage.store(analysis_result) {
+                        log::warn!("Failed to store analysis result: {}", e);
+                    } else {
+                        log::debug!("Analysis result saved");
+                    }
                 }
             }
         }
 
-        Some(ProcessResult {
-            event_count: self.event_count,
-        })
+        Some(self.event_count)
     }
 
     /// Handle ProcMon event for agent lifecycle tracking
@@ -401,7 +404,7 @@ impl AgentSight {
         // Main event loop
         while self.running.load(Ordering::SeqCst) {
             if let Some(result) = self.try_process() {
-                log::trace!("[Event {}] Processed", result.event_count);
+                log::trace!("[Event {}] Processed", result);
             } else {
                 // No event available — flush any timed-out pending GenAI events
                 self.flush_expired_pending_genai();
@@ -418,14 +421,32 @@ impl AgentSight {
     /// Shutdown gracefully
     pub fn shutdown(&mut self) {
         self.running.store(false, Ordering::SeqCst);
+        // Flush all pending GenAI events before exit
+        self.flush_all_pending_genai();
         // poller will be dropped automatically when AgentSight is dropped
+    }
+
+    /// Install an FFI event sender for C API mode.
+    /// When set, completed events are pushed through this channel.
+    pub fn set_ffi_sender(&mut self, sender: FfiEventSender) {
+        self.ffi_sender = Some(sender);
     }
 
     /// Export GenAI events to all registered exporters
     fn export_genai_events(&self, events: &[GenAISemanticEvent]) {
-        for exporter in &self.genai_exporters {
-            exporter.export(events);
-            log::debug!("Exported {} GenAI events via '{}'", events.len(), exporter.name());
+        if let Some(ref sender) = self.ffi_sender {
+            // FFI mode: deliver LLMCall events via callback channel only.
+            for event in events {
+                if let GenAISemanticEvent::LLMCall(call) = event {
+                    sender.send(FfiEvent::Llm(call.clone()));
+                }
+            }
+        } else {
+            // Normal mode: export to all registered exporters.
+            for exporter in &self.genai_exporters {
+                exporter.export(events);
+                log::debug!("Exported {} GenAI events via '{}'", events.len(), exporter.name());
+            }
         }
     }
 
